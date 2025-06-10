@@ -26,6 +26,11 @@ export class WebRTCFileTransfer {
   private receivedChunks = 0
   private fileMetadata: FileTransferOffer | null = null
 
+  private worker: Worker | null = null
+  private sendingFile: File | null = null
+  private sendingOfferId: string | null = null
+  private sendingChunks: number = 0
+
   constructor(
     onProgress: (progress: number) => void,
     onComplete: (file: File) => void,
@@ -40,6 +45,7 @@ export class WebRTCFileTransfer {
     })
 
     this.setupPeerConnection()
+    this.setupWorker()
   }
 
   private setupPeerConnection() {
@@ -148,6 +154,48 @@ export class WebRTCFileTransfer {
     this.onComplete(file)
   }
 
+  // --- Inline Web Worker setup for chunking ---
+  private setupWorker() {
+    const workerScript = `
+      self.onmessage = async function(e) {
+        const { file, chunkSize, id } = e.data;
+        const totalChunks = Math.ceil(file.size / chunkSize);
+        let offset = 0, index = 0;
+        while (offset < file.size) {
+          const slice = file.slice(offset, offset + chunkSize);
+          const reader = new FileReader();
+          reader.onload = function(ev) {
+            // 16 bytes header for chunkIndex
+            const chunkIndexBuffer = new ArrayBuffer(16);
+            new DataView(chunkIndexBuffer).setUint32(0, index, false);
+            // Concatenate header+chunk
+            const chunk = new Uint8Array(chunkIndexBuffer.byteLength + ev.target.result.byteLength);
+            chunk.set(new Uint8Array(chunkIndexBuffer), 0);
+            chunk.set(new Uint8Array(ev.target.result), chunkIndexBuffer.byteLength);
+            self.postMessage({ index, chunk: chunk.buffer }, [chunk.buffer]);
+          };
+          reader.readAsArrayBuffer(slice);
+          await new Promise(res => reader.onloadend = res);
+          offset += chunkSize;
+          index++;
+        }
+      };
+    `
+    const blob = new Blob([workerScript], { type: 'application/javascript' })
+    this.worker = new Worker(URL.createObjectURL(blob))
+    this.worker.onmessage = (e) => {
+      // Send chunk via dataChannel
+      if (this.dataChannel && this.dataChannel.readyState === "open") {
+        this.dataChannel.send(e.data.chunk)
+        // Progress update
+        if (this.sendingChunks) {
+          const progress = ((e.data.index + 1) / this.sendingChunks) * 100
+          this.onProgress(progress)
+        }
+      }
+    }
+  }
+
   async sendFile(file: File) {
     if (!this.dataChannel || this.dataChannel.readyState !== "open") {
       this.onError("Data channel not ready")
@@ -166,6 +214,11 @@ export class WebRTCFileTransfer {
       checksum: await this.calculateChecksum(file),
     }
 
+    // Store state for sending
+    this.sendingFile = file
+    this.sendingOfferId = offer.id
+    this.sendingChunks = chunks
+
     // Send file offer
     this.sendDataChannelMessage({
       type: "file-offer",
@@ -174,8 +227,14 @@ export class WebRTCFileTransfer {
   }
 
   private async startFileTransfer() {
-    // Implementation would continue here with actual file sending
-    // This is a simplified version for demonstration
+    // Start chunking and sending the file in the worker
+    if (this.worker && this.sendingFile && this.sendingChunks && this.sendingOfferId) {
+      this.worker.postMessage({
+        file: this.sendingFile,
+        chunkSize: 16384,
+        id: this.sendingOfferId,
+      })
+    }
   }
 
   private sendDataChannelMessage(message: any) {
@@ -227,5 +286,9 @@ export class WebRTCFileTransfer {
       this.dataChannel.close()
     }
     this.peerConnection.close()
+    if (this.worker) {
+      this.worker.terminate()
+      this.worker = null
+    }
   }
 }
